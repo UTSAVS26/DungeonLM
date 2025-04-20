@@ -23,10 +23,6 @@
 
 ## 🚀 Getting Started
 
-<p align="center">
-  <img src="https://media.giphy.com/media/xT0xeJpnrWC4XWblEk/giphy.gif" alt="Rocket Launch" width="350"/>
-</p>
-
 ### ✅ Requirements
 
 - Python 3.8+
@@ -110,10 +106,6 @@ requirements.txt      # Dependencies
 
 ## 💡 Ideas for Expansion
 
-<p align="center">
-  <img src="https://media.giphy.com/media/j3gsT2RsH9K0w/giphy.gif" alt="Expansion Ideas" width="400"/>
-</p>
-
 - 🗣️ Add voice commands or text-to-speech narration
 - 👥 Expand to support co-op multiplayer
 - 🧙 Add magic schools, item crafting, or divine blessings
@@ -123,4 +115,3 @@ requirements.txt      # Dependencies
 ---
 
 > 🎲 DungeonLM brings the magic of tabletop roleplaying to your screen — driven by imagination and AI.
-```
