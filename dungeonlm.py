@@ -8,12 +8,19 @@ import os
 import io
 import base64
 from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union, Literal
 from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime
+from enum import Enum
+import asyncio
+from pydantic import BaseModel, Field, validator
 
 # Import LLM clients
 import openai
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint import MemorySaver
+from langgraph.prebuilt import ToolExecutor
+import pydantic_core
 
 # Constants
 DEFAULT_SYSTEM_PROMPT = """
@@ -70,72 +77,135 @@ OPENAI_MODELS = [
     "gpt-3.5-turbo"
 ]
 
-# Data Models
-@dataclass
-class Character:
+# Pydantic Models
+class ActionType(str, Enum):
+    MOVE = "move"
+    ATTACK = "attack"
+    TALK = "talk"
+    SEARCH = "search"
+    USE = "use"
+    CAST = "cast"
+    REST = "rest"
+    OTHER = "other"
+
+class EntityType(str, Enum):
+    PLAYER = "player"
+    ENEMY = "enemy"
+    NPC = "npc"
+
+class Stats(BaseModel):
+    STR: int = Field(10, description="Strength stat")
+    DEX: int = Field(10, description="Dexterity stat")
+    CON: int = Field(10, description="Constitution stat")
+    INT: int = Field(10, description="Intelligence stat")
+    WIS: int = Field(10, description="Wisdom stat")
+    CHA: int = Field(10, description="Charisma stat")
+    
+    @validator('STR', 'DEX', 'CON', 'INT', 'WIS', 'CHA', pre=True)
+    def validate_stats(cls, v):
+        """Validate stats are between 1 and 20"""
+        v = int(v)
+        if v < 1 or v > 30:
+            raise ValueError(f"Stats must be between the ranges of 1-30, got {v}")
+        return v
+
+class Character(BaseModel):
     id: str
     name: str
     race: str
     character_class: str
-    level: int
+    level: int = Field(1, ge=1, le=20)
     hp: int
     max_hp: int
-    stats: Dict[str, int]
-    inventory: List[str]
-    gold: int
-    xp: int
-    spells: List[str] = field(default_factory=list)
+    stats: Stats
+    inventory: List[str] = Field(default_factory=list)
+    gold: int = Field(0, ge=0)
+    xp: int = Field(0, ge=0)
+    spells: List[str] = Field(default_factory=list)
     background: str = ""
     alignment: str = "Neutral"
     
-@dataclass
-class NPC:
+    class Config:
+        validate_assignment = True
+
+class NPC(BaseModel):
     id: str
     name: str
     description: str
     disposition: str = "Neutral"  # Friendly, Neutral, Hostile
     location: str = ""
+    dialogue: Dict[str, str] = Field(default_factory=dict)
     
-@dataclass
-class Location:
+class Location(BaseModel):
     id: str
     name: str
     description: str
-    connected_locations: List[str] = field(default_factory=list)
-    npcs: List[str] = field(default_factory=list)
+    connected_locations: List[str] = Field(default_factory=list)
+    npcs: List[str] = Field(default_factory=list)
+    items: List[str] = Field(default_factory=list)
     visited: bool = False
     
-@dataclass
-class Quest:
+class QuestStatus(str, Enum):
+    ACTIVE = "Active"
+    COMPLETED = "Completed"
+    FAILED = "Failed"
+    
+class Quest(BaseModel):
     id: str
     title: str
     description: str
-    status: str = "Active"  # Active, Completed, Failed
-    rewards: Dict[str, Any] = field(default_factory=dict)
-    steps: List[str] = field(default_factory=list)
+    status: QuestStatus = QuestStatus.ACTIVE
+    rewards: Dict[str, Any] = Field(default_factory=dict)
+    steps: List[str] = Field(default_factory=list)
     current_step: int = 0
     
-@dataclass
-class Campaign:
+class Enemy(BaseModel):
+    id: str
+    name: str
+    hp: int
+    max_hp: int
+    ac: int
+    attack_bonus: int
+    damage_dice: str
+    dex_mod: int
+    
+class InitiativeEntry(BaseModel):
+    id: str
+    name: str
+    initiative: int
+    entity_type: EntityType
+
+class CombatEncounter(BaseModel):
+    id: str
+    enemies: List[Enemy]
+    initiative_order: List[InitiativeEntry]
+    current_turn_idx: int = 0
+    round: int = 1
+    active: bool = True
+    
+class CampaignState(BaseModel):
     id: str
     title: str
     setting: str
     theme: str
-    characters: List[Character] = field(default_factory=list)
-    npcs: List[NPC] = field(default_factory=list)
-    locations: List[Location] = field(default_factory=list)
-    quests: List[Quest] = field(default_factory=list)
+    characters: List[Character] = Field(default_factory=list)
+    npcs: List[NPC] = Field(default_factory=list)
+    locations: List[Location] = Field(default_factory=list)
+    quests: List[Quest] = Field(default_factory=list)
     current_location_id: str = ""
-    history: List[Dict[str, Any]] = field(default_factory=list)
+    history: List[Dict[str, Any]] = Field(default_factory=list)
+    current_combat: Optional[CombatEncounter] = None
     
-@dataclass
-class CombatEncounter:
-    id: str
-    enemies: List[Dict[str, Any]]
-    initiative_order: List[str]
-    current_turn: int = 0
-    round: int = 1
-    active: bool = True
+class UserAction(BaseModel):
+    action_type: ActionType
+    target: Optional[str] = None
+    content: str
+    
+class GameState(BaseModel):
+    campaign: CampaignState
+    conversation_history: List[Dict[str, str]] = Field(default_factory=list)
+    last_user_action: Optional[UserAction] = None
+    system_messages: List[str] = Field(default_factory=list)
 
 # LLM Client Wrapper
 class LLMClient:
@@ -148,6 +218,23 @@ class LLMClient:
             self.model = model or "gpt-4o"
         else:
             raise ValueError(f"Unsupported provider: {provider}")
+
+    async def generate_async(self, system_prompt, conversation_history, max_tokens=2000, temperature=0.7):
+        try:
+            messages = [{"role": "system", "content": system_prompt}] + conversation_history
+
+            response = await asyncio.to_thread(
+                self.client.chat.completions.create,
+                model=self.model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature
+            )
+            return response.choices[0].message.content
+
+        except Exception as e:
+            st.error(f"Error generating content: {str(e)}")
+            return f"The Dungeon Master seems to be taking a break. Please try again. Error: {str(e)}"
 
     def generate(self, system_prompt, conversation_history, max_tokens=2000, temperature=0.7):
         try:
@@ -165,983 +252,1057 @@ class LLMClient:
             st.error(f"Error generating content: {str(e)}")
             return f"The Dungeon Master seems to be taking a break. Please try again. Error: {str(e)}"
 
-# DungeonLM Core
-class DungeonLM:
-    def __init__(self, llm_client=None):
-        self.llm_client = llm_client
-        self.campaign = None
-        self.current_combat = None
-        self.system_prompt = DEFAULT_SYSTEM_PROMPT
-        self.conversation_history = []
+# LangGraph Tools
+class CharacterTools:
+    def add_item_to_inventory(self, state: GameState, item_name: str) -> GameState:
+        """Add an item to the player's inventory"""
+        if not state.campaign.characters:
+            return state
             
-    def create_campaign(self, title, setting, theme):
-        campaign_id = str(uuid.uuid4())
-        self.campaign = Campaign(
-            id=campaign_id,
-            title=title,
-            setting=setting,
-            theme=theme
+        # Add item to first character's inventory
+        state.campaign.characters[0].inventory.append(item_name)
+        state.system_messages.append(f"Added {item_name} to inventory")
+        return state
+        
+    def add_gold(self, state: GameState, amount: int) -> GameState:
+        """Add gold to the player's wallet"""
+        if not state.campaign.characters:
+            return state
+            
+        state.campaign.characters[0].gold += amount
+        state.system_messages.append(f"Added {amount} gold")
+        return state
+        
+    def modify_hp(self, state: GameState, amount: int) -> GameState:
+        """Modify character's HP by given amount (positive for healing, negative for damage)"""
+        if not state.campaign.characters:
+            return state
+            
+        char = state.campaign.characters[0]
+        char.hp = max(0, min(char.max_hp, char.hp + amount))
+        
+        if amount > 0:
+            state.system_messages.append(f"Healed {amount} HP")
+        else:
+            state.system_messages.append(f"Took {abs(amount)} damage")
+            
+        return state
+
+class LocationTools:
+    def move_to_location(self, state: GameState, location_id: str) -> GameState:
+        """Move the player to a new location"""
+        # Check if location exists
+        location_exists = False
+        for loc in state.campaign.locations:
+            if loc.id == location_id:
+                location_exists = True
+                loc.visited = True
+                break
+                
+        if location_exists:
+            state.campaign.current_location_id = location_id
+            state.system_messages.append(f"Moved to new location")
+        else:
+            state.system_messages.append(f"Location not found")
+            
+        return state
+        
+    def create_location(self, 
+                      state: GameState, 
+                      name: str, 
+                      description: str, 
+                      connect_to_current: bool = True) -> GameState:
+        """Create a new location and optionally connect it to current location"""
+        location_id = str(uuid.uuid4())
+        new_location = Location(
+            id=location_id,
+            name=name,
+            description=description
         )
         
-        # Add campaign setup to conversation history
-        self.conversation_history.append({
-            "role": "system", 
-            "content": f"Campaign '{title}' created with setting '{setting}' and theme '{theme}'. Initialize the world and starting location."
-        })
+        state.campaign.locations.append(new_location)
         
-        return self.campaign
-    
-    def add_character(self, name, race, character_class, level=1):
-        char_id = str(uuid.uuid4())
+        # Connect to current location if requested
+        if connect_to_current and state.campaign.current_location_id:
+            current_loc = None
+            for loc in state.campaign.locations:
+                if loc.id == state.campaign.current_location_id:
+                    current_loc = loc
+                    break
+                    
+            if current_loc:
+                current_loc.connected_locations.append(location_id)
+                new_location.connected_locations.append(current_loc.id)
+                
+        state.system_messages.append(f"Created new location: {name}")
+        return state
+
+class NPCTools:
+    def add_npc(self, 
+              state: GameState, 
+              name: str, 
+              description: str, 
+              disposition: str = "Neutral") -> GameState:
+        """Add a new NPC to the current location"""
+        npc_id = str(uuid.uuid4())
         
-        # Set default stats based on class
-        base_stats = {"STR": 10, "DEX": 10, "CON": 10, "INT": 10, "WIS": 10, "CHA": 10}
-        if character_class.lower() in ["warrior", "fighter", "barbarian", "paladin"]:
-            base_stats["STR"] += 4
-            base_stats["CON"] += 2
-        elif character_class.lower() in ["rogue", "ranger", "monk"]:
-            base_stats["DEX"] += 4
-            base_stats["WIS"] += 2
-        elif character_class.lower() in ["wizard", "sorcerer", "warlock"]:
-            base_stats["INT"] += 4
-            base_stats["CHA"] += 2
-        elif character_class.lower() in ["cleric", "druid"]:
-            base_stats["WIS"] += 4
-            base_stats["CON"] += 2
+        npc = NPC(
+            id=npc_id,
+            name=name,
+            description=description,
+            disposition=disposition,
+            location=state.campaign.current_location_id
+        )
         
-        # Calculate HP based on class and level
-        base_hp = 8
-        if character_class.lower() in ["barbarian"]:
-            base_hp = 12
-        elif character_class.lower() in ["fighter", "paladin", "ranger"]:
-            base_hp = 10
-        elif character_class.lower() in ["wizard", "sorcerer", "warlock"]:
-            base_hp = 6
+        state.campaign.npcs.append(npc)
+        
+        # Add NPC to current location
+        if state.campaign.current_location_id:
+            for loc in state.campaign.locations:
+                if loc.id == state.campaign.current_location_id:
+                    loc.npcs.append(npc_id)
+                    break
+                    
+        state.system_messages.append(f"Added NPC: {name}")
+        return state
+
+class CombatTools:
+    def start_combat(self, state: GameState, enemy_names: List[str]) -> GameState:
+        """Start a combat encounter with specified enemies"""
+        if state.campaign.current_combat and state.campaign.current_combat.active:
+            state.system_messages.append("Combat already in progress")
+            return state
             
-        max_hp = base_hp + ((base_hp // 2) * (level - 1))
+        # Create enemies
+        enemies = []
+        for name in enemy_names:
+            enemy_id = str(uuid.uuid4())
+            hp = random.randint(10, 30)
+            
+            enemy = Enemy(
+                id=enemy_id,
+                name=name,
+                hp=hp,
+                max_hp=hp,
+                ac=random.randint(10, 16),
+                attack_bonus=random.randint(2, 6),
+                damage_dice=f"{random.randint(1, 3)}d{random.choice([4, 6, 8])}",
+                dex_mod=random.randint(-1, 3)
+            )
+            enemies.append(enemy)
+            
+        # Roll initiative
+        initiative_entries = []
+        
+        # Player initiative
+        for character in state.campaign.characters:
+            initiative = random.randint(1, 20) + (character.stats.DEX - 10) // 2
+            initiative_entries.append(
+                InitiativeEntry(
+                    id=character.id,
+                    name=character.name,
+                    initiative=initiative,
+                    entity_type=EntityType.PLAYER
+                )
+            )
+            
+        # Enemy initiative
+        for enemy in enemies:
+            initiative = random.randint(1, 20) + enemy.dex_mod
+            initiative_entries.append(
+                InitiativeEntry(
+                    id=enemy.id,
+                    name=enemy.name,
+                    initiative=initiative,
+                    entity_type=EntityType.ENEMY
+                )
+            )
+            
+        # Sort by initiative
+        initiative_entries.sort(key=lambda x: x.initiative, reverse=True)
+        
+        # Create combat encounter
+        combat_id = str(uuid.uuid4())
+        combat = CombatEncounter(
+            id=combat_id,
+            enemies=enemies,
+            initiative_order=initiative_entries,
+            current_turn_idx=0,
+            round=1,
+            active=True
+        )
+        
+        state.campaign.current_combat = combat
+        state.system_messages.append(f"Started combat with {', '.join(enemy_names)}")
+        return state
+        
+    def end_combat(self, state: GameState) -> GameState:
+        """End the current combat encounter"""
+        if not state.campaign.current_combat or not state.campaign.current_combat.active:
+            state.system_messages.append("No active combat to end")
+            return state
+            
+        state.campaign.current_combat.active = False
+        state.system_messages.append("Combat ended")
+        return state
+        
+    def next_turn(self, state: GameState) -> GameState:
+        """Advance to the next turn in combat"""
+        if not state.campaign.current_combat or not state.campaign.current_combat.active:
+            state.system_messages.append("No active combat")
+            return state
+            
+        combat = state.campaign.current_combat
+        combat.current_turn_idx = (combat.current_turn_idx + 1) % len(combat.initiative_order)
+        
+        # If we've gone through everyone, increase round counter
+        if combat.current_turn_idx == 0:
+            combat.round += 1
+            
+        # Get current entity
+        current_entity = combat.initiative_order[combat.current_turn_idx]
+        state.system_messages.append(f"Combat round {combat.round}: {current_entity.name}'s turn")
+        
+        return state
+        
+    def damage_enemy(self, state: GameState, enemy_id: str, damage: int) -> GameState:
+        """Apply damage to an enemy"""
+        if not state.campaign.current_combat:
+            state.system_messages.append("No active combat")
+            return state
+            
+        for i, enemy in enumerate(state.campaign.current_combat.enemies):
+            if enemy.id == enemy_id:
+                enemy.hp = max(0, enemy.hp - damage)
+                state.campaign.current_combat.enemies[i] = enemy
+                
+                # Check if enemy is defeated
+                if enemy.hp <= 0:
+                    state.system_messages.append(f"{enemy.name} has been defeated!")
+                    
+                    # Remove from initiative if necessary
+                    state.campaign.current_combat.initiative_order = [
+                        entry for entry in state.campaign.current_combat.initiative_order 
+                        if entry.id != enemy_id
+                    ]
+                    
+                    # Check if all enemies are defeated
+                    all_defeated = all(e.hp <= 0 for e in state.campaign.current_combat.enemies)
+                    if all_defeated:
+                        state.campaign.current_combat.active = False
+                        state.system_messages.append("All enemies defeated. Combat ended.")
+                else:
+                    state.system_messages.append(f"{enemy.name} took {damage} damage")
+                break
+                
+        return state
+
+class QuestTools:
+    def add_quest(self, 
+                state: GameState, 
+                title: str, 
+                description: str,
+                steps: List[str] = None) -> GameState:
+        """Add a new quest to the campaign"""
+        quest_id = str(uuid.uuid4())
+        
+        quest = Quest(
+            id=quest_id,
+            title=title,
+            description=description,
+            steps=steps or []
+        )
+        
+        state.campaign.quests.append(quest)
+        state.system_messages.append(f"Added new quest: {title}")
+        return state
+        
+    def complete_quest(self, state: GameState, quest_id: str) -> GameState:
+        """Mark a quest as completed"""
+        for i, quest in enumerate(state.campaign.quests):
+            if quest.id == quest_id:
+                quest.status = QuestStatus.COMPLETED
+                state.campaign.quests[i] = quest
+                state.system_messages.append(f"Completed quest: {quest.title}")
+                
+                # Add rewards if specified
+                if "gold" in quest.rewards:
+                    if state.campaign.characters:
+                        state.campaign.characters[0].gold += quest.rewards["gold"]
+                        
+                if "xp" in quest.rewards:
+                    if state.campaign.characters:
+                        state.campaign.characters[0].xp += quest.rewards["xp"]
+                break
+                
+        return state
+
+# Custom LangGraph nodes
+def parse_user_action(state: GameState) -> Dict[str, Any]:
+    """Parse the user's input to determine their action"""
+    if not state.conversation_history or state.conversation_history[-1]["role"] != "user":
+        return {"state": state}
+        
+    user_input = state.conversation_history[-1]["content"].lower()
+    
+    # Determine action type
+    action_type = ActionType.OTHER
+    target = None
+    
+    # Movement actions
+    movement_patterns = [
+        r"go to (.*)", r"enter (.*)", r"visit (.*)", r"travel to (.*)",
+        r"head to (.*)", r"move to (.*)", r"explore (.*)", r"walk to (.*)"
+    ]
+    
+    for pattern in movement_patterns:
+        match = re.search(pattern, user_input)
+        if match:
+            action_type = ActionType.MOVE
+            target = match.group(1).strip()
+            break
+            
+    # Attack actions
+    attack_patterns = [
+        r"attack (.*)", r"fight (.*)", r"strike (.*)", r"hit (.*)",
+        r"shoot (.*)", r"stab (.*)", r"slash (.*)"
+    ]
+    
+    for pattern in attack_patterns:
+        match = re.search(pattern, user_input)
+        if match:
+            action_type = ActionType.ATTACK
+            target = match.group(1).strip()
+            break
+            
+    # Talk actions
+    talk_patterns = [
+        r"talk to (.*)", r"speak to (.*)", r"ask (.*)", r"communicate with (.*)",
+        r"greet (.*)", r"chat with (.*)", r"converse with (.*)", r"address (.*)"
+    ]
+    
+    for pattern in talk_patterns:
+        match = re.search(pattern, user_input)
+        if match:
+            action_type = ActionType.TALK
+            target = match.group(1).strip()
+            break
+            
+    # Search actions
+    search_patterns = [
+        r"search (.*)", r"look for (.*)", r"examine (.*)", r"investigate (.*)",
+        r"inspect (.*)", r"check (.*)", r"look at (.*)", r"search for (.*)"
+    ]
+    
+    for pattern in search_patterns:
+        match = re.search(pattern, user_input)
+        if match:
+            action_type = ActionType.SEARCH
+            target = match.group(1).strip()
+            break
+            
+    # Use actions
+    use_patterns = [
+        r"use (.*)", r"activate (.*)", r"drink (.*)", r"employ (.*)",
+        r"utilize (.*)", r"apply (.*)", r"consume (.*)", r"wield (.*)"
+    ]
+    
+    for pattern in use_patterns:
+        match = re.search(pattern, user_input)
+        if match:
+            action_type = ActionType.USE
+            target = match.group(1).strip()
+            break
+            
+    # Cast actions
+    cast_patterns = [
+        r"cast (.*)", r"spell (.*)", r"incantation (.*)", r"magic (.*)"
+    ]
+    
+    for pattern in cast_patterns:
+        match = re.search(pattern, user_input)
+        if match:
+            action_type = ActionType.CAST
+            target = match.group(1).strip()
+            break
+            
+    # Rest actions
+    if any(word in user_input for word in ["rest", "sleep", "camp", "nap"]):
+        action_type = ActionType.REST
+    
+    # Update user action in state
+    state.last_user_action = UserAction(
+        action_type=action_type,
+        target=target,
+        content=user_input
+    )
+    
+    return {"state": state}
+
+def process_movement(state: GameState) -> Dict[str, Union[GameState, str]]:
+    """Process movement actions"""
+    if not state.last_user_action or state.last_user_action.action_type != ActionType.MOVE:
+        return {"state": state}
+        
+    target = state.last_user_action.target
+    if not target:
+        return {"state": state}
+        
+    # Check if target is a connected location
+    current_loc = None
+    target_loc = None
+    
+    for loc in state.campaign.locations:
+        if loc.id == state.campaign.current_location_id:
+            current_loc = loc
+            
+        # Case-insensitive match on location name
+        if loc.name.lower() == target.lower():
+            target_loc = loc
+            
+    # If we found both locations, check if they're connected
+    if current_loc and target_loc:
+        if target_loc.id in current_loc.connected_locations:
+            # Move to location
+            state.campaign.current_location_id = target_loc.id
+            target_loc.visited = True
+            state.system_messages.append(f"Moved to {target_loc.name}")
+        else:
+            state.system_messages.append(f"Cannot move directly to {target_loc.name}")
+    elif target and current_loc:
+        # Create new location and connect it
+        location_tools = LocationTools()
+        state = location_tools.create_location(
+            state,
+            name=target.title(),
+            description=f"A newly discovered area: {target}",
+            connect_to_current=True
+        )
+        
+        # Find the newly created location
+        for loc in state.campaign.locations:
+            if loc.name.lower() == target.title().lower():
+                state.campaign.current_location_id = loc.id
+                break
+                
+    return {"state": state}
+
+def process_combat(state: GameState) -> Dict[str, Union[GameState, str]]:
+    """Process combat and attack actions"""
+    if not state.last_user_action:
+        return {"state": state}
+        
+    # Check if we should start combat
+    if state.last_user_action.action_type == ActionType.ATTACK and not (state.campaign.current_combat and state.campaign.current_combat.active):
+        # Start combat with target
+        if state.last_user_action.target:
+            enemy_names = [state.last_user_action.target.title()]
+            combat_tools = CombatTools()
+            state = combat_tools.start_combat(state, enemy_names)
+    
+    # Process combat actions if in combat
+    if state.campaign.current_combat and state.campaign.current_combat.active:
+        combat = state.campaign.current_combat
+        current_turn = combat.initiative_order[combat.current_turn_idx]
+        
+        # Only process player actions on player turn
+        if current_turn.entity_type == EntityType.PLAYER:
+            # Attack action
+            if state.last_user_action.action_type == ActionType.ATTACK:
+                target = state.last_user_action.target
+                if target:
+                    # Find matching enemy
+                    for enemy in combat.enemies:
+                        if enemy.name.lower() in target.lower() or target.lower() in enemy.name.lower():
+                            # Roll attack
+                            attack_roll = random.randint(1, 20)
+                            
+                            # Get player's attack bonus based on class
+                            attack_bonus = 0
+                            if state.campaign.characters:
+                                char = state.campaign.characters[0]
+                                if char.character_class.lower() in ["fighter", "barbarian", "paladin"]:
+                                    attack_bonus = (char.stats.STR - 10) // 2 + char.level // 3
+                                elif char.character_class.lower() in ["rogue", "ranger"]:
+                                    attack_bonus = (char.stats.DEX - 10) // 2 + char.level // 3
+                                elif char.character_class.lower() in ["wizard", "sorcerer", "warlock"]:
+                                    attack_bonus = (char.stats.INT - 10) // 2 + char.level // 3
+                                elif char.character_class.lower() in ["cleric", "druid"]:
+                                    attack_bonus = (char.stats.WIS - 10) // 2 + char.level // 3
+                                    
+                            total_attack = attack_roll + attack_bonus
+                            
+                            # Check if hit
+                            if total_attack >= enemy.ac:
+                                # Roll damage
+                                damage_roll = random.randint(1, 6) + attack_bonus // 2
+                                
+                                # Apply damage
+                                combat_tools = CombatTools()
+                                state = combat_tools.damage_enemy(state, enemy.id, damage_roll)
+                                
+                                state.system_messages.append(
+                                    f"Attack hit! Rolled {attack_roll} + {attack_bonus} = {total_attack} vs AC {enemy.ac}. "
+                                    f"Dealt {damage_roll} damage."
+                                )
+                            else:
+                                state.system_messages.append(
+                                    f"Attack missed! Rolled {attack_roll} + {attack_bonus} = {total_attack} vs AC {enemy.ac}."
+                                )
+                            
+                            # Move to next turn
+                            combat_tools = CombatTools()
+                            state = combat_tools.next_turn(state)
+                            break
+                    
+            # Cast spell action
+            elif state.last_user_action.action_type == ActionType.CAST:
+                # Move to next turn after spell cast
+                combat_tools = CombatTools()
+                state = combat_tools.next_turn(state)
+                
+            # Move to enemy turn if we're still in player turn
+            elif state.last_user_action.content.lower() == "end turn":
+                combat_tools = CombatTools()
+                state = combat_tools.next_turn(state)
+        
+    return {"state": state}
+
+def process_npc_interaction(state: GameState) -> Dict[str, Union[GameState, str]]:
+    """Process talking to NPCs"""
+    if not state.last_user_action or state.last_user_action.action_type != ActionType.TALK:
+        return {"state": state}
+        
+    target = state.last_user_action.target
+    if not target:
+        return {"state": state}
+        
+    # Find NPCs in current location
+    current_location_npcs = []
+    if state.campaign.current_location_id:
+        for loc in state.campaign.locations:
+            if loc.id == state.campaign.current_location_id:
+                current_location_npcs = loc.npcs
+                break
+    
+    # Check if target NPC exists
+    target_npc = None
+    for npc in state.campaign.npcs:
+        if npc.id in current_location_npcs and npc.name.lower() in target.lower():
+            target_npc = npc
+            break
+            
+    # If NPC not found, create them
+    if not target_npc:
+        npc_tools = NPCTools()
+        state = npc_tools.add_npc(
+            state,
+            name=target.title(),
+            description=f"A person you've met in your travels.",
+            disposition="Neutral"
+        )
+        
+    return {"state": state}
+
+def process_search(state: GameState) -> Dict[str, Union[GameState, str]]:
+    """Process search actions"""
+    if not state.last_user_action or state.last_user_action.action_type != ActionType.SEARCH:
+        return {"state": state}
+        
+    # Chance to find items or gold
+    if random.random() < 0.3:
+        item_options = [
+            "Small Potion", "Rusty Key", "Map Fragment", "Old Coin", 
+            "Scroll", "Gemstone", "Amulet", "Lockpick"
+        ]
+        item = random.choice(item_options)
+        
+        character_tools = CharacterTools()
+        state = character_tools.add_item_to_inventory(state, item)
+        state.system_messages.append(f"Found: {item}")
+    
+    if random.random() < 0.2:
+        gold_amount = random.randint(1, 10)
+        
+        character_tools = CharacterTools()
+        state = character_tools.add_gold(state, gold_amount)
+        state.system_messages.append(f"Found {gold_amount} gold coins")
+        
+    # Chance to discover a hidden area or feature
+    if random.random() < 0.15:
+        # Add a message about discovering something
+        state.system_messages.append("You discovered something interesting...")
+        
+        # Chance to find a secret door to a new location
+        if random.random() < 0.5:
+            location_name = f"Hidden {random.choice(['Chamber', 'Cavern', 'Passage', 'Alcove', 'Room'])}"
+            
+            location_tools = LocationTools()
+            state = location_tools.create_location(
+                state,
+                name=location_name,
+                description=f"A secret area you discovered by searching carefully.",
+                connect_to_current=True
+            )
+            
+    return {"state": state}
+
+def generate_dm_response(state: GameState) -> Dict[str, Union[GameState, str]]:
+    """Generate DM response using the LLM"""
+    # Create system prompt with context about the campaign
+    system_prompt = DEFAULT_SYSTEM_PROMPT + "\n\n"
+    
+    # Add campaign info
+    system_prompt += f"Campaign: {state.campaign.title}\n"
+    system_prompt += f"Setting: {state.campaign.setting}\n"
+    system_prompt += f"Theme: {state.campaign.theme}\n\n"
+    
+    # Add character info
+    if state.campaign.characters:
+        char = state.campaign.characters[0]
+        system_prompt += f"Player Character: {char.name}, Level {char.level} {char.race} {char.character_class}\n"
+        system_prompt += f"HP: {char.hp}/{char.max_hp}, XP: {char.xp}\n"
+        system_prompt += f"Inventory: {', '.join(char.inventory)}\n"
+        system_prompt += f"Gold: {char.gold}\n\n"
+    
+    # Add current location info
+    current_location = None
+    for loc in state.campaign.locations:
+        if loc.id == state.campaign.current_location_id:
+            current_location = loc
+            break
+    
+    if current_location:
+        system_prompt += f"Current Location: {current_location.name}\n"
+        system_prompt += f"Description: {current_location.description}\n"
+        
+        # Add NPCs in location
+        location_npcs = []
+        for npc_id in current_location.npcs:
+            for npc in state.campaign.npcs:
+                if npc.id == npc_id:
+                    location_npcs.append(npc.name)
+                    break
+        
+        if location_npcs:
+            system_prompt += f"NPCs present: {', '.join(location_npcs)}\n"
+        
+        # Add connected locations
+        connected_locations = []
+        for loc_id in current_location.connected_locations:
+            for loc in state.campaign.locations:
+                if loc.id == loc_id:
+                    connected_locations.append(loc.name)
+                    break
+        
+        if connected_locations:
+            system_prompt += f"Connected areas: {', '.join(connected_locations)}\n"
+    
+    # Add active combat info
+    if state.campaign.current_combat and state.campaign.current_combat.active:
+        combat = state.campaign.current_combat
+        system_prompt += f"\nCOMBAT IN PROGRESS - Round {combat.round}\n"
+        
+        # Current initiative
+        current_entity = combat.initiative_order[combat.current_turn_idx]
+        system_prompt += f"Current turn: {current_entity.name}\n"
+        
+        # Initiative order
+        system_prompt += "Initiative order:\n"
+        for entry in combat.initiative_order:
+            system_prompt += f"- {entry.name}: {entry.initiative}\n"
+        
+        # Enemy status
+        system_prompt += "Enemy status:\n"
+        for enemy in combat.enemies:
+            hp_percent = enemy.hp / enemy.max_hp * 100
+            status = "Healthy"
+            if hp_percent <= 25:
+                status = "Near death"
+            elif hp_percent <= 50:
+                status = "Badly wounded"
+            elif hp_percent <= 75:
+                status = "Wounded"
+            
+            system_prompt += f"- {enemy.name}: {enemy.hp}/{enemy.max_hp} HP ({status})\n"
+    
+    # Add active quests
+    active_quests = [q for q in state.campaign.quests if q.status == QuestStatus.ACTIVE]
+    if active_quests:
+        system_prompt += "\nActive Quests:\n"
+        for quest in active_quests:
+            system_prompt += f"- {quest.title}: {quest.description}\n"
+    
+    # Add system messages as additional context
+    if state.system_messages:
+        system_prompt += "\nRecent Events:\n"
+        # Only include the last 5 system messages to avoid prompt too long
+        for msg in state.system_messages[-5:]:
+            system_prompt += f"- {msg}\n"
+    
+    # Get conversation history for LLM context
+    # Only include the last 10 turns to avoid token limits
+    conversation_context = state.conversation_history[-10:]
+    
+    # Call the LLM
+    try:
+        # Create LLM client if not already in session state
+        if "llm_client" not in st.session_state:
+            if "openai_api_key" in st.session_state and st.session_state.openai_api_key:
+                model = st.session_state.get("selected_model", "gpt-4o")
+                st.session_state.llm_client = LLMClient("openai", st.session_state.openai_api_key, model)
+            else:
+                return {"state": state, "next": "error"}
+        
+        llm_client = st.session_state.llm_client
+        response = llm_client.generate(system_prompt, conversation_context)
+        
+        # Add the response to conversation history
+        state.conversation_history.append({"role": "assistant", "content": response})
+        
+        return {"state": state, "next": "output"}
+    except Exception as e:
+        st.error(f"Error generating DM response: {str(e)}")
+        return {"state": state, "next": "error"}
+
+# Set up LangGraph
+def setup_dungeon_graph() -> StateGraph:
+    """Set up the LangGraph for the dungeon game"""
+    # Create a graph
+    dungeon_graph = StateGraph(GameState)
+    
+    # Add all the different tool executors
+    character_tools_executor = ToolExecutor(tools=[CharacterTools()])
+    location_tools_executor = ToolExecutor(tools=[LocationTools()])
+    npc_tools_executor = ToolExecutor(tools=[NPCTools()])
+    combat_tools_executor = ToolExecutor(tools=[CombatTools()])
+    quest_tools_executor = ToolExecutor(tools=[QuestTools()])
+    
+    # Add nodes to the graph
+    dungeon_graph.add_node("parse_user_action", parse_user_action)
+    dungeon_graph.add_node("process_movement", process_movement)
+    dungeon_graph.add_node("process_combat", process_combat)
+    dungeon_graph.add_node("process_npc_interaction", process_npc_interaction)
+    dungeon_graph.add_node("process_search", process_search)
+    dungeon_graph.add_node("generate_dm_response", generate_dm_response)
+    
+    # Add edges
+    dungeon_graph.add_edge("parse_user_action", "process_movement")
+    dungeon_graph.add_edge("process_movement", "process_combat")
+    dungeon_graph.add_edge("process_combat", "process_npc_interaction")
+    dungeon_graph.add_edge("process_npc_interaction", "process_search")
+    dungeon_graph.add_edge("process_search", "generate_dm_response")
+    
+    # Add conditional edges from generate_dm_response
+    dungeon_graph.add_conditional_edges(
+        "generate_dm_response",
+        lambda x: x.get("next", "output"),
+        {
+            "output": END,
+            "error": END
+        }
+    )
+    
+    # Compile the graph
+    dungeon_graph.compile()
+    
+    return dungeon_graph
+
+# Streamlit UI functions
+def create_character():
+    """Create a new character"""
+    st.header("Create Your Character")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        name = st.text_input("Character Name", "Adventurer")
+        race = st.selectbox("Race", ["Human", "Elf", "Dwarf", "Halfling", "Half-Elf", "Half-Orc", "Dragonborn", "Tiefling"])
+        character_class = st.selectbox("Class", ["Fighter", "Wizard", "Rogue", "Cleric", "Ranger", "Paladin", "Barbarian", "Bard", "Druid", "Sorcerer", "Warlock", "Monk"])
+        level = st.number_input("Level", min_value=1, max_value=20, value=1)
+        
+    with col2:
+        # Generate random stats with a slight boost
+        stats = {
+            "STR": st.slider("Strength", 3, 18, random.randint(8, 16)),
+            "DEX": st.slider("Dexterity", 3, 18, random.randint(8, 16)),
+            "CON": st.slider("Constitution", 3, 18, random.randint(8, 16)),
+            "INT": st.slider("Intelligence", 3, 18, random.randint(8, 16)),
+            "WIS": st.slider("Wisdom", 3, 18, random.randint(8, 16)),
+            "CHA": st.slider("Charisma", 3, 18, random.randint(8, 16))
+        }
+    
+    background = st.text_area("Character Background (Optional)", "")
+    alignment = st.selectbox("Alignment", ["Lawful Good", "Neutral Good", "Chaotic Good", "Lawful Neutral", "True Neutral", "Chaotic Neutral", "Lawful Evil", "Neutral Evil", "Chaotic Evil"], index=4)
+    
+    # Calculate HP based on class and constitution
+    base_hp = {
+        "Barbarian": 12,
+        "Fighter": 10, 
+        "Paladin": 10,
+        "Ranger": 10,
+        "Monk": 8,
+        "Rogue": 8,
+        "Bard": 8,
+        "Cleric": 8,
+        "Druid": 8,
+        "Warlock": 8,
+        "Wizard": 6,
+        "Sorcerer": 6
+    }
+    
+    con_modifier = (stats["CON"] - 10) // 2
+    max_hp = base_hp.get(character_class, 8) + con_modifier
+    max_hp = max(1, max_hp)  # Ensure minimum of 1 HP
+    
+    # Create character
+    if st.button("Create Character"):
+        character_id = str(uuid.uuid4())
         
         character = Character(
-            id=char_id,
+            id=character_id,
             name=name,
             race=race,
             character_class=character_class,
             level=level,
             hp=max_hp,
             max_hp=max_hp,
-            stats=base_stats,
-            inventory=["Backpack", "Bedroll", "Rations (5)"],
-            gold=50,
-            xp=0
+            stats=Stats(**stats),
+            inventory=["Backpack", "Rations (1 day)", "Waterskin"],
+            gold=random.randint(5, 20),
+            background=background,
+            alignment=alignment
         )
         
-        # Add starting equipment based on class
-        if character_class.lower() in ["warrior", "fighter", "barbarian", "paladin"]:
-            character.inventory.extend(["Longsword", "Shield", "Chainmail"])
-        elif character_class.lower() in ["rogue", "ranger"]:
-            character.inventory.extend(["Shortbow", "Quiver with 20 arrows", "Leather Armor", "Dagger"])
-        elif character_class.lower() in ["wizard", "sorcerer", "warlock"]:
-            character.inventory.extend(["Spellbook", "Wand", "Robes", "Component Pouch"])
-        elif character_class.lower() in ["cleric", "druid"]:
-            character.inventory.extend(["Mace", "Shield", "Holy Symbol", "Scale Mail"])
-            
-        self.campaign.characters.append(character)
+        # Store in session state
+        st.session_state.character = character
+        st.session_state.character_created = True
         
-        # Add character creation to conversation history
-        self.conversation_history.append({
-            "role": "system", 
-            "content": f"Character created: {name}, a level {level} {race} {character_class}. Remember their abilities and stats."
-        })
-        
-        return character
+        st.success("Character created! Now you can start your adventure.")
+        st.experimental_rerun()
+
+def create_campaign():
+    """Create a new campaign"""
+    st.header("Create Your Campaign")
     
-    def add_location(self, name, description, connected_locations=None):
-        location_id = str(uuid.uuid4())
-        location = Location(
-            id=location_id,
-            name=name,
-            description=description,
-            connected_locations=connected_locations or []
-        )
-        
-        self.campaign.locations.append(location)
-        
-        # Set as current location if it's the first one
-        if not self.campaign.current_location_id:
-            self.campaign.current_location_id = location_id
-            
-        return location
+    title = st.text_input("Campaign Title", "The Lost Artifacts")
     
-    def add_npc(self, name, description, disposition="Neutral", location_id=None):
-        npc_id = str(uuid.uuid4())
-        npc = NPC(
-            id=npc_id,
-            name=name,
-            description=description,
-            disposition=disposition,
-            location=location_id or self.campaign.current_location_id
-        )
-        
-        self.campaign.npcs.append(npc)
-        
-        # Add NPC to location
-        if location_id:
-            for loc in self.campaign.locations:
-                if loc.id == location_id:
-                    loc.npcs.append(npc_id)
-                    break
-        elif self.campaign.current_location_id:
-            for loc in self.campaign.locations:
-                if loc.id == self.campaign.current_location_id:
-                    loc.npcs.append(npc_id)
-                    break
-                    
-        return npc
+    setting_options = [
+        "Medieval Fantasy", "High Fantasy", "Dark Fantasy", "Urban Fantasy",
+        "Mythological", "Post-Apocalyptic", "Steampunk", "Sci-Fi Fantasy"
+    ]
+    setting = st.selectbox("Setting", setting_options)
     
-    def add_quest(self, title, description, steps=None, rewards=None):
-        quest_id = str(uuid.uuid4())
-        quest = Quest(
-            id=quest_id,
-            title=title,
-            description=description,
-            steps=steps or [],
-            rewards=rewards or {"gold": 100, "xp": 200}
-        )
-        
-        self.campaign.quests.append(quest)
-        return quest
+    theme_options = [
+        "Heroic Adventure", "Mystery", "Horror", "Political Intrigue",
+        "Exploration", "War", "Heist", "Survival", "Redemption", "Revenge"
+    ]
+    theme = st.selectbox("Theme", theme_options)
     
-    def current_location(self):
-        for loc in self.campaign.locations:
-            if loc.id == self.campaign.current_location_id:
-                return loc
-        return None
-    
-    def move_to_location(self, location_id):
-        # Mark as visited
-        for loc in self.campaign.locations:
-            if loc.id == location_id:
-                loc.visited = True
-                self.campaign.current_location_id = location_id
-                break
-    
-    def get_location_npcs(self, location_id=None):
-        loc_id = location_id or self.campaign.current_location_id
-        npc_ids = []
+    if st.button("Create Campaign"):
+        # Create starting location
+        start_location_id = str(uuid.uuid4())
         
-        for loc in self.campaign.locations:
-            if loc.id == loc_id:
-                npc_ids = loc.npcs
-                break
-                
-        npcs = []
-        for npc_id in npc_ids:
-            for npc in self.campaign.npcs:
-                if npc.id == npc_id:
-                    npcs.append(npc)
-                    
-        return npcs
-    
-    def start_combat(self, enemies):
-        """Start a combat encounter with given enemies"""
-        combat_id = str(uuid.uuid4())
-        
-        # Initialize initiative order
-        initiative_order = []
-        for character in self.campaign.characters:
-            initiative = random.randint(1, 20) + (character.stats["DEX"] - 10) // 2
-            initiative_order.append({"id": character.id, "name": character.name, "initiative": initiative, "type": "player"})
-            
-        for enemy in enemies:
-            initiative = random.randint(1, 20) + (enemy.get("dex_mod", 0))
-            initiative_order.append({"id": enemy["id"], "name": enemy["name"], "initiative": initiative, "type": "enemy"})
-            
-        # Sort by initiative
-        initiative_order.sort(key=lambda x: x["initiative"], reverse=True)
-        initiative_order_ids = [entry["id"] for entry in initiative_order]
-        
-        self.current_combat = CombatEncounter(
-            id=combat_id,
-            enemies=enemies,
-            initiative_order=initiative_order_ids,
-            current_turn=0,
-            round=1,
-            active=True
-        )
-        
-        # Add combat start to conversation history
-        enemy_names = ", ".join([e["name"] for e in enemies])
-        self.conversation_history.append({
-            "role": "system", 
-            "content": f"Combat has started against: {enemy_names}. Initiative order: {', '.join([entry['name'] for entry in initiative_order])}"
-        })
-        
-        return self.current_combat
-    
-    def end_combat(self):
-        """End the current combat encounter"""
-        if self.current_combat:
-            self.current_combat.active = False
-            self.conversation_history.append({
-                "role": "system", 
-                "content": "Combat has ended."
-            })
-            self.current_combat = None
-    
-    def next_turn(self):
-        """Advance to the next turn in combat"""
-        if self.current_combat:
-            self.current_combat.current_turn = (self.current_combat.current_turn + 1) % len(self.current_combat.initiative_order)
-            
-            # If we've gone through everyone, increase round counter
-            if self.current_combat.current_turn == 0:
-                self.current_combat.round += 1
-                
-            # Get current entity
-            current_id = self.current_combat.initiative_order[self.current_combat.current_turn]
-            current_entity = None
-            
-            # Check if it's a player
-            for char in self.campaign.characters:
-                if char.id == current_id:
-                    current_entity = char.name
-                    break
-                    
-            # Check if it's an enemy
-            if not current_entity:
-                for enemy in self.current_combat.enemies:
-                    if enemy["id"] == current_id:
-                        current_entity = enemy["name"]
-                        break
-            
-            self.conversation_history.append({
-                "role": "system", 
-                "content": f"Round {self.current_combat.round}, Turn: {current_entity}'s turn."
-            })
-            
-            return current_entity
-        return None
-    
-    def generate_map(self, size=(15, 10)):
-        """Generate a simple ASCII map of the area"""
-        current_loc = self.current_location()
-        if not current_loc:
-            return "No current location to map."
-        
-        # Create a blank map grid
-        map_grid = [[' ' for _ in range(size[0])] for _ in range(size[1])]
-        
-        # Place current location in center
-        center_x, center_y = size[0] // 2, size[1] // 2
-        map_grid[center_y][center_x] = 'X'  # X marks current location
-        
-        # Get connected locations
-        connected_loc_ids = current_loc.connected_locations
-        connected_locs = []
-        
-        for loc_id in connected_loc_ids:
-            for loc in self.campaign.locations:
-                if loc.id == loc_id:
-                    connected_locs.append(loc)
-                    
-        # Place connected locations around center
-        directions = [
-            (0, -1, "North"), (1, 0, "East"), 
-            (0, 1, "South"), (-1, 0, "West"),
-            (1, -1, "Northeast"), (1, 1, "Southeast"),
-            (-1, 1, "Southwest"), (-1, -1, "Northwest")
-        ]
-        
-        for idx, loc in enumerate(connected_locs[:len(directions)]):
-            dx, dy, direction = directions[idx]
-            x, y = center_x + dx, center_y + dy
-            
-            # Check if position is valid
-            if 0 <= x < size[0] and 0 <= y < size[1]:
-                map_grid[y][x] = loc.name[0].upper()  # First letter of location name
-        
-        # Convert grid to ASCII art
-        map_str = "```\n    N    \n  W + E  \n    S    \n"
-        map_str += "-" * (size[0] + 2) + "\n"
-        
-        for row in map_grid:
-            map_str += "|" + "".join(row) + "|\n"
-            
-        map_str += "-" * (size[0] + 2) + "\n"
-        map_str += "```\n"
-        map_str += f"X = {current_loc.name} (Current Location)\n"
-        
-        # Add legend for connected locations
-        for idx, loc in enumerate(connected_locs[:len(directions)]):
-            dx, dy, direction = directions[idx]
-            x, y = center_x + dx, center_y + dy
-            
-            if 0 <= x < size[0] and 0 <= y < size[1]:
-                map_str += f"{loc.name[0].upper()} = {loc.name} ({direction})\n"
-        
-        return map_str
-    
-    def process_user_input(self, user_input):
-        """Process user input and generate response"""
-        # Add user input to conversation history
-        self.conversation_history.append({"role": "user", "content": user_input})
-        
-        # Get current game state to include in prompt
-        game_state = self._get_game_state_summary()
-        
-        # Combine system prompt with game state
-        full_system_prompt = self.system_prompt + "\n\n" + game_state
-        
-        # Limit conversation history to last 10 exchanges to avoid token limits
-        limited_history = self.conversation_history[-20:]
-        
-        # Generate response
-        if self.llm_client:
-            response = self.llm_client.generate(
-                system_prompt=full_system_prompt,
-                conversation_history=limited_history
-            )
+        # Generate starting location based on setting
+        if setting == "Medieval Fantasy":
+            start_name = "Small Village"
+            start_desc = "A quaint village with thatched-roof buildings and a central marketplace."
+        elif setting == "Urban Fantasy":
+            start_name = "City Streets"
+            start_desc = "The busy streets of a large city where magic and modern technology coexist."
+        elif setting == "Dark Fantasy":
+            start_name = "Gloomy Hamlet"
+            start_desc = "A small settlement shrouded in mist with suspicious townsfolk."
         else:
-            response = "No LLM client configured. Please set up an API key and model."
-        
-        # Add response to conversation history
-        self.conversation_history.append({"role": "assistant", "content": response})
-        
-        # Update game state based on NLP understanding of response
-        self._update_game_state_from_response(response, user_input)
-        
-        return response
-    
-    def _get_game_state_summary(self):
-        """Create a summary of current game state for the LLM"""
-        summary = "CURRENT GAME STATE:\n"
-        
-        # Campaign info
-        summary += f"Campaign: {self.campaign.title} (Setting: {self.campaign.setting}, Theme: {self.campaign.theme})\n\n"
-        
-        # Character info
-        summary += "CHARACTERS:\n"
-        for char in self.campaign.characters:
-            summary += f"- {char.name}: Level {char.level} {char.race} {char.character_class}, HP: {char.hp}/{char.max_hp}, Gold: {char.gold}, XP: {char.xp}\n"
-            summary += f"  Inventory: {', '.join(char.inventory[:5])}" + (f" and {len(char.inventory) - 5} more items" if len(char.inventory) > 5 else "") + "\n"
-        
-        # Current location
-        current_loc = self.current_location()
-        if current_loc:
-            summary += f"\nCURRENT LOCATION: {current_loc.name}\n"
-            summary += f"Description: {current_loc.description[:100]}...\n"
+            start_name = "Starting Area"
+            start_desc = "The beginning of your adventure."
             
-            # Connected locations
-            connected_locs = []
-            for loc_id in current_loc.connected_locations:
-                for loc in self.campaign.locations:
-                    if loc.id == loc_id:
-                        connected_locs.append(loc.name)
-            
-            if connected_locs:
-                summary += f"Connected locations: {', '.join(connected_locs)}\n"
-            
-            # NPCs in location
-            npcs = self.get_location_npcs()
-            if npcs:
-                summary += f"NPCs present: {', '.join([npc.name for npc in npcs])}\n"
+        start_location = Location(
+            id=start_location_id,
+            name=start_name,
+            description=start_desc,
+            visited=True
+        )
         
-        # Active quests
-        active_quests = [q for q in self.campaign.quests if q.status == "Active"]
-        if active_quests:
-            summary += "\nACTIVE QUESTS:\n"
-            for quest in active_quests[:3]:  # Limit to 3 active quests
-                summary += f"- {quest.title}: {quest.description[:100]}...\n"
+        # Create campaign state
+        campaign = CampaignState(
+            id=str(uuid.uuid4()),
+            title=title,
+            setting=setting,
+            theme=theme,
+            locations=[start_location],
+            current_location_id=start_location_id
+        )
         
-        # Combat info
-        if self.current_combat and self.current_combat.active:
-            summary += "\nCOMBAT STATUS:\n"
-            summary += f"Round: {self.current_combat.round}\n"
-            
-            # Get current turn entity
-            current_id = self.current_combat.initiative_order[self.current_combat.current_turn]
-            current_entity = "Unknown"
-            
-            # Check if it's a player
-            for char in self.campaign.characters:
-                if char.id == current_id:
-                    current_entity = char.name
-                    break
-                    
-            # Check if it's an enemy
-            if current_entity == "Unknown":
-                for enemy in self.current_combat.enemies:
-                    if enemy["id"] == current_id:
-                        current_entity = enemy["name"]
-                        break
-            
-            summary += f"Current turn: {current_entity}\n"
-            
-            # List enemies with health
-            summary += "Enemies:\n"
-            for enemy in self.current_combat.enemies:
-                hp_percent = (enemy["hp"] / enemy["max_hp"]) * 100
-                status = "Healthy"
-                if hp_percent <= 25:
-                    status = "Near Death"
-                elif hp_percent <= 50:
-                    status = "Badly Wounded"
-                elif hp_percent <= 75:
-                    status = "Wounded"
-                
-                summary += f"- {enemy['name']}: {status} ({enemy['hp']}/{enemy['max_hp']} HP)\n"
+        # Add character to campaign
+        if hasattr(st.session_state, "character"):
+            campaign.characters.append(st.session_state.character)
         
-        return summary
-    
-    def _update_game_state_from_response(self, response, user_input):
-        """Update game state based on NLP understanding of the response"""
-        # Extract possible location change
-        location_change_pattern = r"You (?:have|are now in|arrive at|enter|reach) (?:the|a) (.+?)(?:\.|\n|$)"
-        location_matches = re.search(location_change_pattern, response, re.IGNORECASE)
+        # Create game state
+        initial_state = GameState(
+            campaign=campaign,
+            conversation_history=[]
+        )
         
-        if location_matches:
-            new_location_name = location_matches.group(1).strip()
-            # Check if this is a known location
-            found_location = False
-            for loc in self.campaign.locations:
-                if loc.name.lower() == new_location_name.lower():
-                    self.move_to_location(loc.id)
-                    found_location = True
-                    break
-            
-            # If not found but should be created, create it
-            if not found_location and "enter" in user_input.lower() or "go to" in user_input.lower():
-                # Create a new location
-                new_loc = self.add_location(
-                    new_location_name,
-                    f"A location the party has discovered: {new_location_name}"
-                )
-                
-                # Connect it to current location
-                current_loc = self.current_location()
-                if current_loc:
-                    current_loc.connected_locations.append(new_loc.id)
-                    new_loc.connected_locations.append(current_loc.id)
-                
-                # Move to the new location
-                self.move_to_location(new_loc.id)
+        # Store in session state
+        st.session_state.game_state = initial_state
+        st.session_state.campaign_created = True
         
-        # Check for combat start
-        combat_start_pattern = r"Roll initiative|Combat begins|prepares to attack|hostile creatures|COMBAT INFO"
-        if re.search(combat_start_pattern, response, re.IGNORECASE) and not (self.current_combat and self.current_combat.active):
-            # Try to extract enemy information
-            enemies = []
-            enemy_pattern = r"(?:A|An|The) ([^.!,]+) (?:appears|attacks|charges|emerges)"
-            enemy_matches = re.finditer(enemy_pattern, response, re.IGNORECASE)
-            
-            for match in enemy_matches:
-                enemy_name = match.group(1).strip()
-                enemy_id = str(uuid.uuid4())
-                # Create basic enemy stats
-                enemy = {
-                    "id": enemy_id,
-                    "name": enemy_name,
-                    "hp": random.randint(10, 30),
-                    "max_hp": random.randint(10, 30),
-                    "ac": random.randint(10, 16),
-                    "attack_bonus": random.randint(2, 6),
-                    "damage": f"{random.randint(1, 3)}d{random.choice([4, 6, 8])}",
-                    "dex_mod": random.randint(-1, 3)
-                }
-                enemies.append(enemy)
-            
-            # If we found enemies, start combat
-            if enemies:
-                self.start_combat(enemies)
-            # Otherwise create a generic goblin
-            elif "combat" in user_input.lower() or "attack" in user_input.lower() or "fight" in user_input.lower():
-                enemy_id = str(uuid.uuid4())
-                enemy = {
-                    "id": enemy_id,
-                    "name": "Goblin",
-                    "hp": 15,
-                    "max_hp": 15,
-                    "ac": 13,
-                    "attack_bonus": 4,
-                    "damage": "1d6+2",
-                    "dex_mod": 2
-                }
-                self.start_combat([enemy])
+        # Initialize LangGraph
+        # Use in-memory checkpointing instead of MemorySaver
+        app = setup_dungeon_graph()
+        st.session_state.dungeon_app = app
         
-        # Check for combat end
-        combat_end_pattern = r"combat ends|defeated|victorious|The battle is over"
-        if re.search(combat_end_pattern, response, re.IGNORECASE) and (self.current_combat and self.current_combat.active):
-            self.end_combat()
-        
-        # Check for items received
-        item_pattern = r"You (?:receive|got|find|acquire|loot) (?:a|an|the) ([^.!,]+)"
-        item_matches = re.finditer(item_pattern, response, re.IGNORECASE)
-        
-        for match in item_matches:
-            item_name = match.group(1).strip()
-            if self.campaign.characters:
-                self.campaign.characters[0].inventory.append(item_name)
-                
-        # Check for gold received
-        gold_pattern = r"You (?:receive|got|find|acquire|loot) (\d+) gold"
-        gold_matches = re.search(gold_pattern, response, re.IGNORECASE)
-        
-        if gold_matches:
-            gold_amount = int(gold_matches.group(1))
-            if self.campaign.characters:
-                self.campaign.characters[0].gold += gold_amount
-                
-        # Check for quest updates
-        quest_pattern = r"New quest: (.+?)(?:\.|\n)"
-        quest_matches = re.search(quest_pattern, response, re.IGNORECASE)
-        
-        if quest_matches:
-            quest_title = quest_matches.group(1).strip()
-            self.add_quest(quest_title, f"A quest to {quest_title}")
-        
-        # Check for NPC introduction
-        npc_pattern = r"(?:A|An|The) ([^.!,]+) (?:approaches|greets|welcomes|addresses) you"
-        npc_matches = re.finditer(npc_pattern, response, re.IGNORECASE)
-        
-        for match in npc_matches:
-            npc_name = match.group(1).strip()
-            found_npc = False
-            
-            # Check if NPC already exists
-            for npc in self.campaign.npcs:
-                if npc.name.lower() == npc_name.lower():
-                    found_npc = True
-                    break
-            
-            # Add new NPC if not found
-            if not found_npc:
-                self.add_npc(npc_name, f"An NPC encountered in {self.current_location().name if self.current_location() else 'the world'}")
+        st.success("Campaign created! Your adventure awaits.")
+        st.experimental_rerun()
 
-    def save_to_file(self, filename):
-        """Save campaign to file"""
-        with open(filename, 'w') as f:
-            # Convert campaign to dict
-            campaign_dict = asdict(self.campaign)
-            json.dump(campaign_dict, f)
-    
-    def load_from_file(self, filename):
-        """Load campaign from file"""
-        with open(filename, 'r') as f:
-            campaign_dict = json.load(f)
-            
-            # Convert dict back to Campaign object
-            self.campaign = Campaign(**campaign_dict)
-            
-            # Convert lists of dicts back to proper objects
-            characters = []
-            for char_dict in self.campaign.characters:
-                characters.append(Character(**char_dict))
-            self.campaign.characters = characters
-            
-            npcs = []
-            for npc_dict in self.campaign.npcs:
-                npcs.append(NPC(**npc_dict))
-            self.campaign.npcs = npcs
-            
-            locations = []
-            for loc_dict in self.campaign.locations:
-                locations.append(Location(**loc_dict))
-            self.campaign.locations = locations
-            
-            quests = []
-            for quest_dict in self.campaign.quests:
-                quests.append(Quest(**quest_dict))
-            self.campaign.quests = quests
-
-# UI Helpers
-def generate_ascii_minimap(dm):
-    """Generate a simple ASCII minimap for display"""
-    if not dm.campaign or not dm.current_location():
-        return "No map available"
-    
-    current_loc = dm.current_location()
-    
-    # Create a simple 3x3 grid
-    grid = [['.' for _ in range(3)] for _ in range(3)]
-    grid[1][1] = 'X'  # Current location in center
-    
-    # Add connected locations
-    connected_loc_names = []
-    directions = [(-1, -1), (0, -1), (1, -1), 
-                  (-1, 0),          (1, 0),
-                  (-1, 1),  (0, 1),  (1, 1)]
-    
-    connected_locs = []
-    for loc_id in current_loc.connected_locations:
-        for loc in dm.campaign.locations:
-            if loc.id == loc_id:
-                connected_locs.append(loc)
-                
-    for i, loc in enumerate(connected_locs[:len(directions)]):
-        dx, dy = directions[i]
-        x, y = 1 + dx, 1 + dy
-        grid[y][x] = loc.name[0].upper()  # First letter of location name
-        connected_loc_names.append(f"{loc.name[0].upper()} = {loc.name}")
-    
-    # Convert grid to string
-    map_str = "    N    \n  W + E  \n    S    \n"
-    map_str += "---------\n"
-    
-    for row in grid:
-        map_str += "| " + " ".join(row) + " |\n"
+def display_character_sheet():
+    """Display character sheet in sidebar"""
+    if not hasattr(st.session_state, "character"):
+        return
         
-    map_str += "---------\n"
-    map_str += f"X = {current_loc.name} (Current)\n"
+    char = st.session_state.character
     
-    for name in connected_loc_names:
-        map_str += f"{name}\n"
-        
-    return map_str
-
-def generate_character_sheet(character):
-    """Generate a simple character sheet display"""
-    sheet = f"# {character.name}\n"
-    sheet += f"Level {character.level} {character.race} {character.character_class}\n"
-    sheet += f"HP: {character.hp}/{character.max_hp}  |  XP: {character.xp}  |  Gold: {character.gold}\n\n"
+    st.sidebar.header(f"{char.name}")
+    st.sidebar.write(f"Level {char.level} {char.race} {char.character_class}")
+    
+    # HP bar
+    hp_percent = char.hp / char.max_hp * 100
+    st.sidebar.progress(hp_percent / 100)
+    st.sidebar.write(f"HP: {char.hp}/{char.max_hp}")
     
     # Stats
-    sheet += "## Stats\n"
-    for stat, value in character.stats.items():
-        mod = (value - 10) // 2
-        sheet += f"{stat}: {value} ({'+' if mod >= 0 else ''}{mod})\n"
+    st.sidebar.subheader("Stats")
+    cols = st.sidebar.columns(3)
+    stats = ["STR", "DEX", "CON", "INT", "WIS", "CHA"]
+    
+    for i, stat in enumerate(stats):
+        col_idx = i % 3
+        cols[col_idx].metric(stat, getattr(char.stats, stat))
     
     # Inventory
-    sheet += "\n## Inventory\n"
-    for item in character.inventory:
-        sheet += f"- {item}\n"
+    st.sidebar.subheader("Inventory")
+    st.sidebar.write(f"Gold: {char.gold}")
     
-    # Spells if any
-    if character.spells:
-        sheet += "\n## Spells\n"
-        for spell in character.spells:
-            sheet += f"- {spell}\n"
-            
-    return sheet
+    if char.inventory:
+        items = ", ".join(char.inventory)
+        st.sidebar.write(items)
+    else:
+        st.sidebar.write("Empty")
 
-def parse_messages_for_display(messages):
-    """Parse messages to highlight game elements"""
-    formatted_messages = []
-    
-    for msg in messages:
-        if msg['role'] == 'user':
-            # User message is displayed as-is
-            formatted_messages.append({
-                'role': 'user',
-                'content': msg['content']
-            })
-        elif msg['role'] == 'assistant':
-            # Process DM responses to highlight sections
-            content = msg['content']
-            
-            # Highlight sections
-            content = re.sub(r'\[AVAILABLE ACTIONS\]', '## AVAILABLE ACTIONS', content)
-            content = re.sub(r'\[NEARBY LOCATIONS\]', '## NEARBY LOCATIONS', content)
-            content = re.sub(r'\[COMBAT INFO\]', '## COMBAT INFO', content)
-            
-            formatted_messages.append({
-                'role': 'assistant',
-                'content': content
-            })
-    
-    return formatted_messages
-
-# Streamlit UI
 def main():
-    st.set_page_config(
-        page_title="DungeonLM - Interactive D&D Agent DM",
-        page_icon="🎲",
-        layout="wide"
-    )
-    
-    # Title and description
-    st.title("🎲 DungeonLM - Interactive D&D Agent Dungeon Master")
-    st.markdown("""
-    Welcome to DungeonLM! This AI-powered Dungeon Master will guide you through 
-    an immersive D&D adventure. Create a character, explore the world, and embark on epic quests!
-    """)
+    st.title("🧙‍♂️ DungeonLM - AI Dungeon Master")
     
     # Initialize session state
-    if 'dungeon_master' not in st.session_state:
-        st.session_state.dungeon_master = None
-    if 'messages' not in st.session_state:
-        st.session_state.messages = []
-    if 'character_created' not in st.session_state:
+    if "character_created" not in st.session_state:
         st.session_state.character_created = False
-    if 'campaign_created' not in st.session_state:
+        
+    if "campaign_created" not in st.session_state:
         st.session_state.campaign_created = False
-    if 'adventure_started' not in st.session_state:
-        st.session_state.adventure_started = False
+        
+    if "conversation_history" not in st.session_state:
+        st.session_state.conversation_history = []
     
-    # Sidebar for setup and configuration
+    # Setup sidebar
     with st.sidebar:
-        st.header("Game Setup")
+        st.header("Game Settings")
         
-        # LLM provider selection
-        provider_tab, campaign_tab, character_tab = st.tabs(["LLM Setup", "Campaign", "Character"])
-        
-        with provider_tab:
-            llm_provider = st.selectbox("Select LLM Provider", ["OpenAI"])
+        # API Key input
+        openai_api_key = st.text_input("OpenAI API Key", type="password")
+        if openai_api_key:
+            st.session_state.openai_api_key = openai_api_key
             
-            if llm_provider == "OpenAI":
-                openai_api_key = st.text_input("OpenAI API Key", type="password")
-                model = st.selectbox("Select Model", OPENAI_MODELS)
-                
-                if st.button("Set OpenAI API"):
-                    if openai_api_key:
-                        try:
-                            llm_client = LLMClient("openai", openai_api_key, model)
-                            st.session_state.dungeon_master = DungeonLM(llm_client)
-                            st.success("OpenAI API configured successfully!")
-                        except Exception as e:
-                            st.error(f"Error configuring OpenAI API: {str(e)}")
-                    else:
-                        st.warning("Please enter an API key")
-        
-        with campaign_tab:
-            if st.session_state.dungeon_master:
-                campaign_title = st.text_input("Campaign Title", value="The Lost Artifacts of Eldoria")
-                campaign_setting = st.selectbox(
-                    "Setting", 
-                    ["Fantasy Medieval", "High Fantasy", "Dark Fantasy", "Urban Fantasy", 
-                     "Steampunk", "Post-Apocalyptic", "Sci-Fi Fantasy"]
-                )
-                campaign_theme = st.selectbox(
-                    "Theme",
-                    ["Epic Quest", "Political Intrigue", "Mystery", "Dungeon Crawl", 
-                     "Monster Hunting", "Exploration", "Revenge", "War"]
-                )
-                
-                if st.button("Create Campaign"):
-                    st.session_state.dungeon_master.create_campaign(
-                        campaign_title, campaign_setting, campaign_theme
-                    )
-                    st.session_state.campaign_created = True
-                    st.success(f"Campaign '{campaign_title}' created!")
-            else:
-                st.warning("Please configure an LLM provider first")
-                
-        with character_tab:
-            if st.session_state.dungeon_master and st.session_state.campaign_created:
-                character_name = st.text_input("Character Name", value="Thalion")
-                character_race = st.selectbox(
-                    "Race",
-                    ["Human", "Elf", "Dwarf", "Halfling", "Half-Elf", "Half-Orc", "Gnome", "Tiefling", "Dragonborn"]
-                )
-                character_class = st.selectbox(
-                    "Class",
-                    ["Fighter", "Wizard", "Cleric", "Rogue", "Ranger", "Paladin", "Barbarian", 
-                     "Bard", "Druid", "Monk", "Sorcerer", "Warlock"]
-                )
-                character_level = st.slider("Level", 1, 10, 1)
-                
-                if st.button("Create Character"):
-                    st.session_state.dungeon_master.add_character(
-                        character_name, character_race, character_class, character_level
-                    )
-                    st.session_state.character_created = True
-                    st.success(f"Character '{character_name}' created!")
-            else:
-                st.warning("Please create a campaign first")
-        
-        # Start adventure button
-        if st.session_state.dungeon_master and st.session_state.campaign_created and st.session_state.character_created:
-            if st.button("🎮 Start Adventure"):
-                # Add starting prompt
-                dm = st.session_state.dungeon_master
-                
-                # Create starting location if none exists
-                if not dm.campaign.locations:
-                    dm.add_location("Village of Eldoria", 
-                                   "A small village nestled in the hills. It has a few buildings including an inn, a blacksmith, and a general store.")
-                    dm.add_location("Forest Path", 
-                                   "A winding path leading through the dense forest north of the village.")
-                    dm.add_location("Town Square", 
-                                   "The central gathering place of the village with a well and notice board.")
-                    
-                    # Connect locations
-                    dm.campaign.locations[0].connected_locations = [dm.campaign.locations[1].id, dm.campaign.locations[2].id]
-                    dm.campaign.locations[1].connected_locations = [dm.campaign.locations[0].id]
-                    dm.campaign.locations[2].connected_locations = [dm.campaign.locations[0].id]
-                    
-                    # Add an NPC
-                    dm.add_npc("Mayor Galwin", "The elderly mayor of Eldoria village with a white beard and kind eyes.", "Friendly")
-                
-                # Start the adventure with a prompt
-                character = dm.campaign.characters[0]
-                start_prompt = f"Let's begin our adventure! I am {character.name}, a level {character.level} {character.race} {character.character_class}. Please introduce the setting and give me my first quest."
-                response = dm.process_user_input(start_prompt)
-                
-                # Add to messages for display
-                st.session_state.messages.append({"role": "user", "content": start_prompt})
-                st.session_state.messages.append({"role": "assistant", "content": response})
-                
-                st.session_state.adventure_started = True
-        
-        # Save and load functionality
-        if st.session_state.dungeon_master and st.session_state.campaign_created:
-            st.subheader("Save/Load Game")
-            save_file = st.text_input("Save File Name", "dungeon_lm_save.json")
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("Save Game"):
-                    try:
-                        st.session_state.dungeon_master.save_to_file(save_file)
-                        st.success(f"Game saved to {save_file}")
-                    except Exception as e:
-                        st.error(f"Error saving game: {str(e)}")
-            
-            with col2:
-                if st.button("Load Game"):
-                    try:
-                        st.session_state.dungeon_master.load_from_file(save_file)
-                        st.success(f"Game loaded from {save_file}")
-                        st.session_state.campaign_created = True
-                        st.session_state.character_created = len(st.session_state.dungeon_master.campaign.characters) > 0
-                    except Exception as e:
-                        st.error(f"Error loading game: {str(e)}")
+        # Model selection
+        selected_model = st.selectbox("Select Model", OPENAI_MODELS)
+        st.session_state.selected_model = selected_model
         
         # Display character sheet if character exists
-        if st.session_state.dungeon_master and st.session_state.character_created:
-            st.subheader("Character Sheet")
-            if st.session_state.dungeon_master.campaign.characters:
-                character = st.session_state.dungeon_master.campaign.characters[0]
-                st.markdown(generate_character_sheet(character))
+        if st.session_state.character_created:
+            display_character_sheet()
+            
+        # Reset game button
+        if st.button("Start New Game"):
+            # Reset all game state
+            for key in list(st.session_state.keys()):
+                if key not in ["openai_api_key", "selected_model"]:
+                    del st.session_state[key]
+            st.experimental_rerun()
     
-    # Main game area
-    if st.session_state.dungeon_master and st.session_state.adventure_started:
-        # Display message history
-        messages = parse_messages_for_display(st.session_state.messages)
+    # Check for API key
+    if "openai_api_key" not in st.session_state or not st.session_state.openai_api_key:
+        st.warning("Please enter your OpenAI API key in the sidebar to begin.")
+        return
         
-        # Two-column layout for game
-        col1, col2 = st.columns([3, 1])
+    # Character creation
+    if not st.session_state.character_created:
+        create_character()
+        return
         
-        with col1:
-            # Display chat messages
-            for msg in messages:
-                if msg["role"] == "user":
-                    with st.chat_message("user"):
-                        st.write(msg["content"])
-                else:
-                    with st.chat_message("assistant"):
-                        st.markdown(msg["content"])
+    # Campaign creation
+    if not st.session_state.campaign_created:
+        create_campaign()
+        return
+    
+    # Main game interaction
+    if st.session_state.character_created and st.session_state.campaign_created:
+        # Display conversation history
+        display_conversation()
+        
+        # User input
+        user_input = st.chat_input("What do you do?")
+        
+        if user_input:
+            process_user_input(user_input)
+
+def display_conversation():
+    """Display the conversation history"""
+    for message in st.session_state.game_state.conversation_history:
+        if message["role"] == "assistant":
+            with st.chat_message("assistant", avatar="🧙‍♂️"):
+                st.write(message["content"])
+        elif message["role"] == "user":
+            with st.chat_message("user", avatar="🧝"):
+                st.write(message["content"])
+                
+    # If no conversation yet, display intro
+    if not st.session_state.game_state.conversation_history:
+        # Generate intro message
+        intro_message = f"Welcome to {st.session_state.game_state.campaign.title}, brave adventurer! "
+        intro_message += f"You are about to embark on a journey in a {st.session_state.game_state.campaign.setting} world "
+        intro_message += f"with themes of {st.session_state.game_state.campaign.theme}.\n\n"
+        
+        # Add starting location description
+        for loc in st.session_state.game_state.campaign.locations:
+            if loc.id == st.session_state.game_state.campaign.current_location_id:
+                intro_message += f"You find yourself in {loc.name}. {loc.description}\n\n"
+                break
+                
+        intro_message += "What would you like to do?"
+        
+        with st.chat_message("assistant", avatar="🧙‍♂️"):
+            st.write(intro_message)
             
-            # Player input
-            if user_input := st.chat_input("What do you do? (type your action)"):
-                # Add user message to chat history
-                st.session_state.messages.append({"role": "user", "content": user_input})
-                
-                # Get response from DM
-                response = st.session_state.dungeon_master.process_user_input(user_input)
-                
-                # Add DM response to chat history
-                st.session_state.messages.append({"role": "assistant", "content": response})
-                
-                # Rerun to update UI
-                st.rerun()
-        
-        with col2:
-            # Display minimap
-            st.subheader("Location Map")
-            st.text(generate_ascii_minimap(st.session_state.dungeon_master))
-            
-            # Display current location info
-            current_loc = st.session_state.dungeon_master.current_location()
-            if current_loc:
-                st.subheader("Current Location")
-                st.markdown(f"**{current_loc.name}**")
-                st.write(current_loc.description)
-            
-            # Display NPCs in area
-            npcs = st.session_state.dungeon_master.get_location_npcs()
-            if npcs:
-                st.subheader("NPCs Here")
-                for npc in npcs:
-                    st.markdown(f"**{npc.name}** ({npc.disposition})")
-            
-            # Display active quests
-            active_quests = [q for q in st.session_state.dungeon_master.campaign.quests if q.status == "Active"]
-            if active_quests:
-                st.subheader("Active Quests")
-                for quest in active_quests:
-                    st.markdown(f"**{quest.title}**")
-                    if quest.current_step > 0:
-                        st.write(f"Progress: {quest.current_step}/{len(quest.steps)}")
-            
-            # Show combat info if in combat
-            if st.session_state.dungeon_master.current_combat and st.session_state.dungeon_master.current_combat.active:
-                st.subheader("⚔️ Combat")
-                st.markdown("**Initiative Order:**")
-                
-                # Get initiative order with names
-                initiative_order = []
-                for entity_id in st.session_state.dungeon_master.current_combat.initiative_order:
-                    # Check if it's a character
-                    found = False
-                    for char in st.session_state.dungeon_master.campaign.characters:
-                        if char.id == entity_id:
-                            initiative_order.append(f"👤 {char.name}")
-                            found = True
-                            break
-                    
-                    # Check if it's an enemy
-                    if not found:
-                        for enemy in st.session_state.dungeon_master.current_combat.enemies:
-                            if enemy["id"] == entity_id:
-                                initiative_order.append(f"👹 {enemy['name']}")
-                                break
-                
-                # Mark current turn
-                current_idx = st.session_state.dungeon_master.current_combat.current_turn
-                for i, entity in enumerate(initiative_order):
-                    if i == current_idx:
-                        st.markdown(f"➡️ **{entity}** (Current Turn)")
-                    else:
-                        st.markdown(f"- {entity}")
-                
-                # Enemy status
-                st.markdown("**Enemies:**")
-                for enemy in st.session_state.dungeon_master.current_combat.enemies:
-                    hp_percent = (enemy["hp"] / enemy["max_hp"]) * 100
-                    hp_bar = "🟥" * int(hp_percent // 20) + "⬜" * (5 - int(hp_percent // 20))
-                    st.markdown(f"{enemy['name']}: {enemy['hp']}/{enemy['max_hp']} HP {hp_bar}")
-                
-                # Combat actions helper
-                st.markdown("**Common Combat Actions:**")
-                st.markdown("- Attack [target]")
-                st.markdown("- Cast [spell] at [target]")
-                st.markdown("- Use potion/item")
-                st.markdown("- Dodge/Disengage")
-                
-                # Next turn button
-                if st.button("Next Turn"):
-                    next_entity = st.session_state.dungeon_master.next_turn()
-                    st.write(f"Now it's {next_entity}'s turn!")
-                    st.rerun()
-    else:
-        # Welcome screen with instructions
-        st.subheader("Getting Started")
-        st.markdown("""
-        1. 🛠️ Configure an LLM provider in the sidebar (OpenAI)
-        2. 🌍 Create a campaign with a title, setting, and theme
-        3. 👤 Create your character with a name, race, class, and level
-        4. 🎮 Click "Start Adventure" to begin!
-        
-        The AI Dungeon Master will guide your adventure through a text-based interface.
-        You can type commands like:
-        - "Explore the forest"
-        - "Talk to the innkeeper"
-        - "Search for treasure"
-        - "Attack the goblin"
-        
-        The DM will respond with descriptions, dialogue, and options for your next actions!
-        """)
-        
-        st.image("https://placehold.co/600x400?text=DungeonLM+Fantasy+Adventure", caption="Embark on an epic D&D adventure!")
+        # Add to conversation history
+        st.session_state.game_state.conversation_history.append({"role": "assistant", "content": intro_message})
+
+def process_user_input(user_input):
+    """Process user input and advance the game state"""
+    # Add user input to conversation history
+    st.session_state.game_state.conversation_history.append({"role": "user", "content": user_input})
+    
+    # Run the LangGraph app with user input
+    dungeon_app = st.session_state.dungeon_app
+    game_state = st.session_state.game_state
+    
+    # Show spinner while processing
+    with st.spinner("The Dungeon Master is thinking..."):
+        try:
+            # Run the graph
+            result = dungeon_app.invoke({"state": game_state})
+            st.session_state.game_state = result["state"]
+            st.experimental_rerun()
+        except Exception as e:
+            st.error(f"Error processing game state: {str(e)}")
 
 if __name__ == "__main__":
     main()

@@ -3,3 +3,6 @@ openai==1.12.0
 groq==0.4.0
 pillow==10.2.0
 python-dotenv==1.0.0
+langgraph
+pydantic
+pydantic-ai
